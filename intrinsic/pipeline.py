@@ -265,7 +265,7 @@ def run_gray_pipeline(
 
     return results
 
-def run_pipeline(models, img_arr, stage=4, resize_conf=0.0, base_size=384, linear=False, device='cuda'):
+def run_pipeline(models, img_arr, stage=4, resize_conf=0.0, base_size=384, linear=False, device='cuda', specular_threshold=0.05, inputs='all', maintain_size=False):
     
     results = run_gray_pipeline(
         models,
@@ -274,6 +274,8 @@ def run_pipeline(models, img_arr, stage=4, resize_conf=0.0, base_size=384, linea
         linear=linear,
         device=device,
         base_size=base_size,
+        inputs=inputs,
+        maintain_size=maintain_size
     )
 
     if stage == 1:
@@ -374,7 +376,7 @@ def run_pipeline(models, img_arr, stage=4, resize_conf=0.0, base_size=384, linea
     neg_res = abs(neg_res)
 
     pos_res = res.copy()
-    pos_res[pos_res < 0] = 0
+    pos_res[pos_res < specular_threshold] = 0
 
     results['dif_shd'] = dif_shd
     results['dif_img'] = dif_img
@@ -383,3 +385,213 @@ def run_pipeline(models, img_arr, stage=4, resize_conf=0.0, base_size=384, linea
     results['pos_res'] = pos_res
 
     return results
+
+def run_gray_pipeline_gpu(
+        models,
+        img_arr,
+        resize_conf=0.0,
+        base_size=384,
+        maintain_size=False,
+        linear=False,
+        device='cuda',
+        lstsq_p=0.0,
+        inputs='all'):
+
+    assert isinstance(img_arr, torch.Tensor), "img_arr must be a torch.Tensor"
+    img = img_arr
+    if img.device != torch.device(device):
+        img = img.to(device)
+    if img.dim() != 3:
+        raise ValueError("img tensor must be 3D (H,W,3) or (3,H,W)")
+    if img.shape[0] == 3 and img.shape[-1] != 3:  # CHW -> HWC
+        img_hwc = img.permute(1, 2, 0)
+    elif img.shape[-1] == 3:
+        img_hwc = img
+    else:
+        raise ValueError("Could not infer channel dimension (expect 3 channels)")
+    orig_h, orig_w = img_hwc.shape[:2]
+
+    def torch_resize(hwc_tensor, target_hw):
+        th, tw = target_hw
+        chw = hwc_tensor.permute(2, 0, 1).unsqueeze(0)
+        chw = torch.nn.functional.interpolate(
+            chw, size=(th, tw), mode='bilinear', align_corners=True, antialias=True)
+        return chw.squeeze(0).permute(1, 2, 0)
+
+    if resize_conf is None:
+        img_hwc = torch_resize(img_hwc, (round_32(orig_h), round_32(orig_w)))
+    elif isinstance(resize_conf, int):
+        scale = resize_conf / max(orig_h, orig_w)
+        img_hwc = torch_resize(
+            img_hwc,
+            (round_32(int(orig_h * scale)), round_32(int(orig_w * scale))))
+    elif isinstance(resize_conf, float):
+        #TODO turn this to GPU only resize
+        img_np = img_hwc.detach().cpu().numpy()
+        img_np = optimal_resize(img_np, conf=resize_conf)
+        img_hwc = torch.from_numpy(img_np).to(device)
+
+    fh, fw = img_hwc.shape[:2]
+
+    if not linear:
+        lin_img = img_hwc ** 2.2
+    else:
+        lin_img = img_hwc
+
+    with torch.no_grad():
+        def torch_base_resize(hwc_tensor, base_sz):
+            h, w = hwc_tensor.shape[:2]
+            scale = base_sz / max(h, w)
+            nh = round_32(int(h * scale))
+            nw = round_32(int(w * scale))
+            return torch_resize(hwc_tensor, (nh, nw))
+
+        base_input = torch_base_resize(lin_img, base_size)
+        full_input = lin_img
+
+        # To CHW
+        base_chw = base_input.permute(2, 0, 1).float()
+        full_chw = full_input.permute(2, 0, 1).float()
+
+        base_out = models['ord_model'](base_chw.unsqueeze(0)).squeeze(0)  # C,H,W
+        full_out = models['ord_model'](full_chw.unsqueeze(0)).squeeze(0)
+
+        base_out_hwc = base_out.permute(1, 2, 0)
+        full_out_hwc = full_out.permute(1, 2, 0)
+
+        if base_out_hwc.shape[:2] != (fh, fw):
+            base_out_hwc = torch_resize(base_out_hwc, (fh, fw))
+
+        if inputs == 'all':
+            # port equalize_preds?
+            base_np = base_out_hwc.detach().cpu().numpy()
+            full_np = full_out_hwc.detach().cpu().numpy()
+            lin_np = lin_img.detach().cpu().numpy()
+            ord_base_np, ord_full_np = equalize_predictions(lin_np, base_np, full_np, p=lstsq_p)
+            ord_base = torch.from_numpy(ord_base_np).to(device)
+            ord_full = torch.from_numpy(ord_full_np).to(device)
+        else:
+            ord_base = base_out_hwc
+            ord_full = full_out_hwc
+
+        inp = lin_img.permute(2, 0, 1)                  # 3,H,W
+        bse = ord_base.permute(2, 0, 1)
+        fll = ord_full.permute(2, 0, 1)
+
+        if inputs == 'full':
+            combined = torch.cat((inp, fll), 0).unsqueeze(0)
+        elif inputs == 'base':
+            combined = torch.cat((inp, bse), 0).unsqueeze(0)
+        elif inputs == 'rgb':
+            combined = inp.unsqueeze(0)
+        else:
+            combined = torch.cat((inp, bse, fll), 0).unsqueeze(0)
+
+        inv_shd = models['iid_model'](combined).squeeze(1)  # 1,H,W
+        shd = uninvert(inv_shd)                             # 1,H,W
+        alb = (inp / shd).clamp_min(1e-6)                   # 3,H,W
+
+    inv_shd = inv_shd.squeeze(0)        # H,W
+    gry_alb = alb.permute(1, 2, 0)      # H,W,3
+
+    if maintain_size and (fh != orig_h or fw != orig_w):
+        inv_shd = torch_resize(inv_shd.unsqueeze(-1), (orig_h, orig_w)).squeeze(-1)
+        gry_alb = torch_resize(gry_alb, (orig_h, orig_w))
+        ord_base = torch_resize(ord_base, (orig_h, orig_w))
+        ord_full = torch_resize(ord_full, (orig_h, orig_w))
+        lin_img = torch_resize(lin_img, (orig_h, orig_w))
+        img_hwc = torch_resize(img_hwc, (orig_h, orig_w))
+
+    results = {
+        'ord_full': ord_full,      # H,W,C
+        'ord_base': ord_base,
+        'gry_shd': inv_shd,        # H,W
+        'gry_alb': gry_alb,        # H,W,3
+        'image': img_hwc,          # possibly resized image H,W,3
+        'lin_img': lin_img         # linearized image H,W,3
+    }
+    return results
+
+def run_residual_pipeline_gpu(
+        models,
+        img_arr,
+        resize_conf=0.0,
+        base_size=384,
+        linear=False,
+        device='cuda',
+        specular_threshold=0.05,
+        inputs='all'):
+
+    gray = run_gray_pipeline_gpu(
+        models,
+        img_arr,
+        resize_conf=resize_conf,
+        base_size=base_size,
+        linear=linear,
+        device=device,
+        inputs=inputs
+    )
+    img = gray['lin_img']                 # H,W,3 torch
+    gry_shd = gray['gry_shd']             # H,W
+    gry_alb = gray['gry_alb']             # H,W,3
+
+    # Prep (to CHW)
+    net_img = img.permute(2, 0, 1).unsqueeze(0)        # 1,3,H,W
+    net_shd = gry_shd.unsqueeze(0).unsqueeze(0)        # 1,1,H,W
+    net_alb = gry_alb.permute(2, 0, 1).unsqueeze(0)    # 1,3,H,W
+
+    with torch.no_grad():
+        img_iuv = batch_rgb2iuv(net_img)
+        alb_iuv = batch_rgb2iuv(net_alb)
+
+        orig_h, orig_w = img.shape[:2]
+        scale = base_size / max(orig_h, orig_w)
+        base_sz = (round_32(int(orig_h * scale)), round_32(int(orig_w * scale)))
+
+        def interp(t, size):
+            return torch.nn.functional.interpolate(
+                t, size=size, mode='bilinear', align_corners=True, antialias=True)
+
+        img_iuv_b = interp(img_iuv, base_sz)
+        alb_iuv_b = interp(alb_iuv, base_sz)
+        gry_shd_b = interp(net_shd, base_sz)
+
+        col_inp = torch.cat([img_iuv_b, gry_shd_b, alb_iuv_b], 1)
+        uv_shd = models['col_model'](col_inp)
+        uv_shd = interp(uv_shd, (orig_h, orig_w))
+
+        iuv_shd = torch.cat((net_shd, uv_shd), 1)
+        rough_shd = batch_iuv2rgb(iuv_shd)             # 1,3,H,W
+        rough_alb = (net_img / rough_shd).clamp(1e-3)
+
+        rough_alb *= 0.75 / torch.quantile(rough_alb, 0.99)
+        rough_alb = rough_alb.clamp(1e-3)
+        rough_shd = net_img / rough_alb
+
+        alb_inp = torch.cat([net_img, invert(rough_shd), rough_alb], 1)
+        pred_alb = models['alb_model'](alb_inp).clamp(1e-3)
+
+        net_clr_shd = net_img / pred_alb.clamp(1e-3)
+
+        dif_inp = torch.cat([net_img, invert(net_clr_shd), pred_alb], 1)
+        dif_shd_inv = models['dif_model'](dif_inp)
+        dif_shd = uninvert(dif_shd_inv).clamp(1e-5)     # 1,3,H,W
+
+        hr_alb = pred_alb.squeeze(0).permute(1, 2, 0)          # H,W,3
+        dif_shd_hw3 = dif_shd.squeeze(0).permute(1, 2, 0)      # H,W,3
+        dif_img = hr_alb * dif_shd_hw3
+        res = img - dif_img
+
+        # Residual separation
+        neg_res = (-torch.minimum(res, torch.zeros_like(res)))  
+        pos_res = res.clone()
+        pos_res[pos_res < specular_threshold] = 0.0
+
+    return {
+        'pos_res': pos_res,              # H,W,3
+        'neg_res': neg_res,              # H,W,3
+        'residual': res,                 # H,W,3
+        'dif_img': dif_img,              # H,W,3
+        'diffuse_shading': dif_shd_hw3,  # H,W,3
+        'albedo': hr_alb                 # H,W,3
+    }
